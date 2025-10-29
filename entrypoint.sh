@@ -537,6 +537,33 @@ else
       # No last-known-primary recorded; fall back to PRIMARY_HINT
       log "No last-known-primary recorded; falling back to PRIMARY_HINT='${PRIMARY_HINT}'"
       hint_host=${PRIMARY_HINT%:*}
+      
+      # Special case: if NODE_ID=1 and hint is pg-1, bootstrap as primary after timeout
+      if [ "$NODE_ID" = "1" ] && [ "$hint_host" = "pg-1" ]; then
+        log "NODE_ID=1 and PRIMARY_HINT is pg-1; will bootstrap as primary if no other primary found"
+        # Wait limited time for other primaries
+        for i in $(seq 1 5); do
+          sleep 5
+          current_primary=$(find_new_primary || true)
+          if [ -n "$current_primary" ]; then
+            log "Found existing primary: $current_primary"
+            break
+          fi
+          log "Waiting for existing primary... ($i/5)"
+        done
+        
+        # If no primary found, bootstrap as primary
+        if [ -z "$current_primary" ]; then
+          log "No existing primary found; bootstrapping NODE_ID=1 as primary"
+          init_primary
+          write_last_primary "$NODE_NAME"
+          log "Successfully bootstrapped as primary."
+          # Continue to monitor loop
+          monitor_and_handle_events
+          return
+        fi
+      fi
+      
       # Wait for hint host to come up as primary
       for i in $(seq 1 "$RETRY_ROUNDS"); do
         sleep "$RETRY_INTERVAL"
