@@ -60,7 +60,7 @@ function get_current_primary() {
 }
 
 check_cluster_health() {
-  local status total_nodes=0 online_nodes=0
+  local status total_nodes=0 online_nodes=0 primary_nodes=0 standby_nodes=0 witness_nodes=0
   status=$(gosu postgres repmgr -f "$REPMGR_CONF" cluster show --csv 2>/dev/null || true)
 
   if [ -z "$status" ]; then
@@ -76,43 +76,70 @@ check_cluster_health() {
     role_code="$(trim "$role_code")"
     status_code="$(trim "$status_code")"
     
+    # Skip header or invalid lines
     if ! [[ "$node_id" =~ ^[0-9]+$ ]]; then
       continue
     fi
     
-    # Skip witness nodes (role_code=2) from health calculation
-    if [ "$role_code" = "2" ]; then
-      continue
-    fi
-    
+    # Count all registered nodes
     total_nodes=$((total_nodes+1))
     
-    # status_code: 1 = running
+    # Count by role (but repmgr CSV seems to show all as role_code=0, need to check actual role via separate query)
+    case "$role_code" in
+      "0") primary_nodes=$((primary_nodes+1)) ;;  # May be primary or other
+      "1") standby_nodes=$((standby_nodes+1)) ;;
+      "2") witness_nodes=$((witness_nodes+1)) ;;
+    esac
+    
+    # Count online nodes
     if [ "$status_code" = "1" ]; then
       online_nodes=$((online_nodes+1))
     fi
   done <<< "$status"
 
-  local quorum=$(( total_nodes/2 + 1 ))
+  # Since CSV role_code seems unreliable, let's count PostgreSQL vs witness differently
+  # Assume node_id 99+ are witness nodes
+  local pg_online_nodes=0
+  local pg_total_nodes=0
+  while IFS=',' read -r node_id role_code status_code; do
+    node_id="$(trim "$node_id")"
+    status_code="$(trim "$status_code")"
+    
+    if ! [[ "$node_id" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    
+    # PostgreSQL nodes (node_id < 99)
+    if [ "$node_id" -lt 99 ]; then
+      pg_total_nodes=$((pg_total_nodes+1))
+      if [ "$status_code" = "1" ]; then
+        pg_online_nodes=$((pg_online_nodes+1))
+      fi
+    fi
+  done <<< "$status"
 
-  if [ "$total_nodes" -eq 0 ]; then
+  # Calculate quorum for PostgreSQL nodes only
+  local quorum=$(( pg_total_nodes/2 + 1 ))
+
+  # Health assessment
+  if [ "$pg_total_nodes" -eq 0 ]; then
     echo "UNKNOWN"
     return
   fi
 
-  if [ "$total_nodes" -eq 1 ] && [ "$online_nodes" -eq 1 ]; then
+  # Single node cluster
+  if [ "$pg_total_nodes" -eq 1 ] && [ "$pg_online_nodes" -eq 1 ]; then
     echo "GREEN"
     return
   fi
 
-  if [ "$online_nodes" -eq "$total_nodes" ]; then
-    echo "GREEN"
-  elif [ "$online_nodes" -ge "$quorum" ]; then
-    echo "YELLOW"
-  elif [ "$online_nodes" -eq 1 ] && [ "$total_nodes" -gt 1 ]; then
-    echo "DISASTER"
+  # Multi-node cluster health check
+  if [ "$pg_online_nodes" -eq "$pg_total_nodes" ]; then
+    echo "GREEN"  # All PostgreSQL nodes online
+  elif [ "$pg_online_nodes" -ge "$quorum" ]; then
+    echo "YELLOW"  # Quorum maintained but some nodes down
   else
-    echo "RED"
+    echo "RED"  # Quorum lost
   fi
 }
 
