@@ -428,16 +428,51 @@ else
   current_primary=$(find_new_primary || true)
 
   if [ -n "$current_primary" ]; then
-    # There is a reachable current primary → try rewind + rejoin/register
-    if attempt_rewind "$current_primary"; then
-      if gosu postgres repmgr \
-          -h "${current_primary%:*}" -p "${current_primary#*:}" \
-          -U "$REPMGR_USER" -d "$REPMGR_DB" -f "$REPMGR_CONF" \
-          node rejoin --force --force-rewind; then
-        log "Node successfully rejoined cluster as standby."
-        write_last_primary "${current_primary%:*}"  # Update last known primary
+    # There is a reachable current primary → try rejoin first, then rewind, then clone as last resort
+    log "Found current primary: $current_primary, attempting to rejoin cluster..."
+    
+    # Try 1: Simple rejoin without rewind first
+    if gosu postgres repmgr \
+        -h "${current_primary%:*}" -p "${current_primary#*:}" \
+        -U "$REPMGR_USER" -d "$REPMGR_DB" -f "$REPMGR_CONF" \
+        node rejoin --force; then
+      log "Node successfully rejoined cluster without rewind."
+      write_last_primary "${current_primary%:*}"
+    else
+      log "Simple rejoin failed, trying with pg_rewind..."
+      
+      # Try 2: Rejoin with rewind
+      if attempt_rewind "$current_primary"; then
+        if gosu postgres repmgr \
+            -h "${current_primary%:*}" -p "${current_primary#*:}" \
+            -U "$REPMGR_USER" -d "$REPMGR_DB" -f "$REPMGR_CONF" \
+            node rejoin --force --force-rewind; then
+          log "Node successfully rejoined cluster with rewind."
+          write_last_primary "${current_primary%:*}"
+        else
+          log "Node rejoin with rewind failed; attempting to register as standby."
+          
+          # Try 3: Unregister and re-register as standby
+          gosu postgres repmgr -f "$REPMGR_CONF" \
+            -h "${current_primary%:*}" -p "${current_primary#*:}" \
+            -U "$REPMGR_USER" -d "$REPMGR_DB" \
+            primary unregister --node-id="${NODE_ID}" --force || true
+
+          if gosu postgres repmgr \
+              -h "${current_primary%:*}" -p "${current_primary#*:}" \
+              -U "$REPMGR_USER" -d "$REPMGR_DB" -f "$REPMGR_CONF" \
+              standby register --force; then
+            log "Node registered as standby."
+            write_last_primary "${current_primary%:*}"
+          else
+            log "All rejoin attempts failed; falling back to full clone as last resort."
+            clone_standby "$current_primary"
+          fi
+        fi
       else
-        log "Node rejoin failed; attempting metadata normalize then register."
+        log "pg_rewind failed; attempting direct standby registration before full clone..."
+        
+        # Try 3: Direct standby registration without rewind
         gosu postgres repmgr -f "$REPMGR_CONF" \
           -h "${current_primary%:*}" -p "${current_primary#*:}" \
           -U "$REPMGR_USER" -d "$REPMGR_DB" \
@@ -447,19 +482,16 @@ else
             -h "${current_primary%:*}" -p "${current_primary#*:}" \
             -U "$REPMGR_USER" -d "$REPMGR_DB" -f "$REPMGR_CONF" \
             standby register --force; then
-          log "Node registered as standby (fallback)."
-          write_last_primary "${current_primary%:*}"  # Update last known primary
+          log "Node registered as standby without rewind."
+          write_last_primary "${current_primary%:*}"
         else
-          log "Standby register failed; fallback to full clone."
+          log "All rejoin methods failed; falling back to full clone."
           clone_standby "$current_primary"
         fi
       fi
-
-      wait_for_metadata 30 || true
-    else
-      log "pg_rewind failed; fallback to full clone."
-      clone_standby "$current_primary"
     fi
+
+    wait_for_metadata 30 || true
   else
     # No reachable primary → use last-known-primary logic
     lk_primary="$(read_last_primary)"
