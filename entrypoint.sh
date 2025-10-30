@@ -180,6 +180,10 @@ host    all             app_readwrite   0.0.0.0/0               scram-sha-256
 host    all             app_readonly    ::/0                    scram-sha-256
 host    all             app_readwrite   ::/0                    scram-sha-256
 
+# Pgpool user (SCRAM-SHA-256)
+host    all             pgpool          0.0.0.0/0               scram-sha-256
+host    all             pgpool          ::/0                    scram-sha-256
+
 # Admin and repmgr users (SCRAM-SHA-256)
 host    all             postgres        0.0.0.0/0               scram-sha-256
 host    all             postgres        ::/0                    scram-sha-256
@@ -284,7 +288,16 @@ EOSQL
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
 EOSQL
 
-  log "Application users created successfully"
+  # Pgpool user
+  gosu postgres psql -U "$POSTGRES_USER" -tc "SELECT 1 FROM pg_roles WHERE rolname='pgpool'" | grep -q 1 \
+    || gosu postgres psql -U "$POSTGRES_USER" -c "CREATE USER pgpool WITH PASSWORD '${REPMGR_PASSWORD}';"
+  
+  gosu postgres psql -U "$POSTGRES_USER" <<-EOSQL
+    GRANT pg_monitor TO pgpool;
+    GRANT CONNECT ON DATABASE postgres TO pgpool;
+EOSQL
+
+  log "Application and pgpool users created successfully"
 
   gosu postgres repmgr -f "$REPMGR_CONF" primary register --force
   write_last_primary "$NODE_NAME"
