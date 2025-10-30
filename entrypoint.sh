@@ -263,6 +263,9 @@ init_primary() {
   gosu postgres psql -U "$POSTGRES_USER" -tc "SELECT 1 FROM pg_database WHERE datname='${REPMGR_DB}'" | grep -q 1 \
     || gosu postgres psql -U "$POSTGRES_USER" -c "CREATE DATABASE ${REPMGR_DB} OWNER ${REPMGR_USER};"
 
+  # Set password for postgres user
+  gosu postgres psql -U "$POSTGRES_USER" -c "ALTER USER postgres PASSWORD '${POSTGRES_PASSWORD}';"
+
   # Create application users with limited permissions
   log "Creating application users..."
   
